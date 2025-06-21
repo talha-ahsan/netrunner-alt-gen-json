@@ -6,6 +6,7 @@ import (
 	"image"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -37,6 +38,8 @@ type cardImage struct {
 	DPMM   float64
 	Data   *image.RGBA
 }
+
+var id_idx, type_idx, name_idx, faction_idx, text_idx int
 
 func newCardImage(data *image.RGBA) cardImage {
 	imgDPMM := float64(data.Bounds().Max.X) / CARD_WIDTH_MM
@@ -144,7 +147,7 @@ func generatePnPFile(csvPath string) error {
 			*imageCount++
 
 			// Create a new page if necessary
-			if *imageCount%9 == 8 {
+			if *imageCount%9 == 0 {
 				canv.RenderTo(p)
 				p.NewPage(PAGE_WIDTH_MM, PAGE_HEIGHT_MM)
 				canv = canvas.New(PAGE_WIDTH_MM, PAGE_HEIGHT_MM)
@@ -166,7 +169,26 @@ func generatePnPFile(csvPath string) error {
 		frameColorText = "000000"
 
 		cardID := startRow
+
+		// Autodetect columns
+		for i, col := range records[0] {
+			if strings.HasSuffix(col, "ID") {
+				id_idx = i
+			} else if col == "Card Type" {
+				type_idx = i
+			} else if col == "Card Name" {
+				name_idx = i
+			} else if col == "Faction" {
+				faction_idx = i
+			} else if strings.Contains(col, "Card Text") || strings.Contains(col, "Card Summary") {
+				text_idx = i
+			}
+		}
+
 		for i, record := range records[startRow-1:] {
+			if record[text_idx] == "CUT FROM SET" {
+				continue
+			}
 			if i == 0 {
 				imageCount_three = i
 				imageCount_one = i
@@ -179,7 +201,7 @@ func generatePnPFile(csvPath string) error {
 			}
 
 			// Create image drawer
-			imgPath := fmt.Sprintf("%s/%s.png", imageDir, record[1])
+			imgPath := fmt.Sprintf("%s/%s.png", imageDir, record[id_idx])
 
 			_, imgFileErr := os.Stat(imgPath)
 			var drawer art.Drawer
@@ -203,13 +225,25 @@ func generatePnPFile(csvPath string) error {
 				pageMarginY = (PAGE_HEIGHT_MM - (cardImg.Height * 3)) / 2
 			}
 
-			// Draw to 3x PDF (only 1x for identities)
-			if card.Attributes.CardTypeID == "runner_identity" || card.Attributes.CardTypeID == "corp_identity" {
-				pdfCanvas_three, pdfContext_three = addCardToPage(&imageCount_three, cardImg, pdfCanvas_three, pdfContext_three, p_three)
-			} else {
-				for j := 0; j < 3; j++ {
-					pdfCanvas_three, pdfContext_three = addCardToPage(&imageCount_three, cardImg, pdfCanvas_three, pdfContext_three, p_three)
+			var card_count int
+			var re = regexp.MustCompile(`Limit (\d+) per deck`)
+			match := re.FindStringSubmatch(card.Attributes.Text)
+
+			// Check if there's a special limit per deck or if it's an ID
+			if match != nil {
+				card_count, err = strconv.Atoi(match[1])
+				if err != nil {
+					panic(err)
 				}
+			} else if card.Attributes.CardTypeID == "runner_identity" || card.Attributes.CardTypeID == "corp_identity" {
+				card_count = 1
+			} else {
+				card_count = 3
+			}
+
+			// Draw to 3x PDF
+			for j := 0; j < card_count; j++ {
+				pdfCanvas_three, pdfContext_three = addCardToPage(&imageCount_three, cardImg, pdfCanvas_three, pdfContext_three, p_three)
 			}
 
 			// Draw to 1x PDF
@@ -257,7 +291,7 @@ func buildCard(record []string, cardID int) *nrdb.Printing {
 	titleStripper := strings.NewReplacer(" ", "", ".", "", ",", "", "-", "", "!", "", "◆", "")
 
 	// Split summary into sections for ease of use
-	summary_sections := strings.Split(record[4], "====")
+	summary_sections := strings.Split(record[text_idx], "====")
 	lower_sections := summary_sections[1]
 	summary_sections = []string{summary_sections[0]}
 	summary_sections = append(summary_sections, strings.Split(lower_sections, "----")...)
@@ -268,21 +302,21 @@ func buildCard(record []string, cardID int) *nrdb.Printing {
 	// Set ID, faction, name, and type
 	card.ID = strconv.Itoa(cardID)
 	card.Attributes.PositionInSet = cardID
-	if record[0] == "Weyland" {
+	if record[faction_idx] == "Weyland" {
 		card.Attributes.FactionID = "weyland_consortium"
 	} else {
-		card.Attributes.FactionID = strings.ReplaceAll(strings.ToLower(record[0]), "-", "_")
+		card.Attributes.FactionID = strings.ReplaceAll(strings.ToLower(record[faction_idx]), "-", "_")
 	}
-	card.Attributes.Title = strings.ReplaceAll(record[2], "\n", "")
-	card.Attributes.StrippedTitle = titleStripper.Replace(record[2])
+	card.Attributes.Title = strings.ReplaceAll(record[name_idx], "\n", "")
+	card.Attributes.StrippedTitle = titleStripper.Replace(record[name_idx])
 	card.Attributes.IsUnique = strings.Contains(summary_sections[0], "◆")
-	if record[3] == "Runner-ID" {
+	if record[type_idx] == "Runner-ID" {
 		card.Attributes.CardTypeID = "runner_identity"
 		card.Attributes.CardAbilities.MUProvided = nil
-	} else if record[3] == "Corp-ID" {
+	} else if record[type_idx] == "Corp-ID" {
 		card.Attributes.CardTypeID = "corp_identity"
 	} else {
-		card.Attributes.CardTypeID = strings.ToLower(record[3])
+		card.Attributes.CardTypeID = strings.ToLower(record[type_idx])
 	}
 
 	// Set subtypes
@@ -300,6 +334,9 @@ func buildCard(record []string, cardID int) *nrdb.Printing {
 	cost_line := strings.Split(summary_sections[2], ", ")
 	for _, cost := range cost_line {
 		tokens := strings.Split(cost, ": ")
+		if len(tokens) <= 1 {
+			continue
+		}
 		val, _ := strconv.Atoi(tokens[1])
 		switch tokens[0] {
 		case "Advancements":
